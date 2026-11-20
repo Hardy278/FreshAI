@@ -1,4 +1,3 @@
-
 import lightgbm as lgb
 import pandas as pd
 import numpy as np
@@ -25,43 +24,43 @@ DEFAULT_FEATURES = [
 ]
 
 
+def _prepare_features(df: pd.DataFrame, feature_cols: list, categories=None):
+    """准备模型特征，并统一 item_id 的类别定义。"""
+
+    X = df[feature_cols].copy()
+
+    if "item_id" in feature_cols:
+        if categories is None:
+            categories = sorted(X["item_id"].astype(str).unique())
+
+        category_type = pd.CategoricalDtype(categories=categories)
+        X["item_id"] = X["item_id"].astype(str).astype(category_type)
+
+        if X["item_id"].isna().any():
+            raise ValueError("数据中出现训练集未包含的商品类别")
+
+    return X
+
+
 def prepare_model_data(
     train_df: pd.DataFrame,
     valid_df: pd.DataFrame,
     feature_cols: list = None
 ):
-    """
-    准备 LightGBM 所需的训练集和验证集。
-
-    统一 item_id 的类别定义，避免训练集和验证集
-    的类别编码不一致。
-    """
+    """ 准备 LightGBM 所需的训练集和验证集。 """
 
     if feature_cols is None:
         feature_cols = DEFAULT_FEATURES
 
-    train = train_df.copy()
-    valid = valid_df.copy()
+    train = train_df.dropna(subset=["lag_28", "rolling_mean_28"]).copy()
+    valid = valid_df.dropna(subset=["lag_28", "rolling_mean_28"]).copy()
 
-    # 删除历史特征不足的样本
-    train = train.dropna(subset=["lag_28", "rolling_mean_28"])
-    valid = valid.dropna(subset=["lag_28", "rolling_mean_28"])
-
-    # 使用训练集的商品类别定义
     categories = sorted(train["item_id"].astype(str).unique())
 
-    category_type = pd.CategoricalDtype(categories=categories)
+    X_train = _prepare_features(train, feature_cols, categories)
+    X_valid = _prepare_features(valid, feature_cols, categories)
 
-    train["item_id"] = (train["item_id"].astype(str).astype(category_type))
-    valid["item_id"] = (valid["item_id"].astype(str).astype(category_type))
-
-    if valid["item_id"].isna().any():
-        raise ValueError("验证集中出现训练集未包含的商品类别")
-
-    X_train = train[feature_cols]
     y_train = train["sales"]
-
-    X_valid = valid[feature_cols]
     y_valid = valid["sales"]
 
     return X_train, y_train, X_valid, y_valid
@@ -72,13 +71,13 @@ def train_lightgbm(
     valid_df: pd.DataFrame,
     feature_cols: list = None
 ):
-    """ 训练 LightGBM 销量预测模型。 """
+    """训练 LightGBM 销量预测模型，并通过 Early Stopping 选择迭代轮数。"""
 
     if feature_cols is None:
         feature_cols = DEFAULT_FEATURES
 
-    X_train, y_train, X_valid, y_valid = (
-        prepare_model_data(train_df, valid_df, feature_cols)
+    X_train, y_train, X_valid, y_valid = prepare_model_data(
+        train_df, valid_df, feature_cols
     )
 
     model = lgb.LGBMRegressor(
@@ -117,22 +116,84 @@ def train_lightgbm(
     return model
 
 
-def predict_lightgbm(model, df: pd.DataFrame, feature_cols: list = None) -> np.ndarray:
-    """ 使用训练好的 LightGBM 模型预测销量。 """
+def train_lightgbm_final(
+    train_df: pd.DataFrame,
+    n_estimators: int,
+    feature_cols: list = None
+):
+    """使用完整训练数据和固定迭代轮数训练最终模型。"""
 
     if feature_cols is None:
         feature_cols = DEFAULT_FEATURES
 
-    X = df[feature_cols].copy()
+    if n_estimators <= 0:
+        raise ValueError("n_estimators 必须大于 0")
 
-    # 使用模型训练时的类别定义
-    categories = model.booster_.pandas_categorical
+    train = train_df.dropna(
+        subset=["lag_28", "rolling_mean_28"]
+    ).copy()
 
-    if categories:
-        category_type = pd.CategoricalDtype(categories=categories[0])
-        
-        X["item_id"] = X["item_id"].astype(str).astype(category_type)
+    categories = sorted(train["item_id"].astype(str).unique())
 
-    predictions = model.predict(X, num_iteration=model.best_iteration_)
+    X_train = _prepare_features(train, feature_cols, categories)
+    y_train = train["sales"]
+
+    model = lgb.LGBMRegressor(
+        objective="regression",
+        n_estimators=n_estimators,
+        learning_rate=0.05,
+        num_leaves=31,
+        max_depth=-1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_lambda=1.0,
+        random_state=42,
+        n_jobs=-1,
+        verbosity=-1
+    )
+
+    print("开始训练最终 LightGBM 模型...")
+    print(f"训练样本：{len(X_train)}")
+    print(f"固定迭代轮数：{n_estimators}")
+
+    model.fit(
+        X_train,
+        y_train,
+        categorical_feature=["item_id"]
+    )
+
+    print("最终模型训练完成！")
+
+    return model
+
+
+def predict_lightgbm(
+    model,
+    df: pd.DataFrame,
+    feature_cols: list = None
+) -> np.ndarray:
+    """使用训练好的 LightGBM 模型预测销量。"""
+
+    if feature_cols is None:
+        feature_cols = DEFAULT_FEATURES
+
+    categories = None
+
+    if "item_id" in feature_cols:
+        pandas_categories = model.booster_.pandas_categorical
+
+        if pandas_categories:
+            categories = pandas_categories[0]
+
+    X = _prepare_features(df, feature_cols, categories)
+
+    # Early Stopping 模型使用最佳迭代轮数；
+    # 固定轮数训练的最终模型使用全部树。
+    best_iteration = getattr(model, "best_iteration_", None)
+
+    if best_iteration is not None and best_iteration > 0:
+        predictions = model.predict(X, num_iteration=best_iteration)
+    else:
+        predictions = model.predict(X)
 
     return np.maximum(predictions, 0)
