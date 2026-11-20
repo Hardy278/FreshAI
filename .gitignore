@@ -1,0 +1,10 @@
+.vscode/
+
+__pycache__/
+
+data/raw/calendar.csv
+data/raw/sales_train_validation.csv
+data/raw/sell_prices.csv
+
+artifacts/
+notebooks/
