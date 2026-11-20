@@ -362,3 +362,16 @@ def run_training_pipeline():
         "demand_patterns": demand_patterns,
         "type_results": type_results
     }
+
+def load_final_model(artifacts_dir=ARTIFACTS_DIR):
+    """加载已经训练完成的最终模型。"""
+    model_path = artifacts_dir / "lightgbm_final.pkl"
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"模型文件不存在：{model_path}")
+
+    model = joblib.load(model_path)
+
+    print(f"最终模型加载成功：{model_path}")
+
+    return model
